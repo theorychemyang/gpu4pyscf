@@ -84,21 +84,22 @@ static void _screen_index(int8_t *non0shl_mask, double log_cutoff,
         }
         __syncthreads();
         // check if any GTO values on grids are larger than threshold
-        if (is_large) {
-            continue;
-        }
-        int ng_in_tile = min(NG_PER_BLOCK, ngrids-grid0);
-        for (int grid_id = 0; grid_id < ng_in_tile; ++grid_id) {
-            double rx = gridx_cache[grid_id] - atom_x;
-            double ry = gridy_cache[grid_id] - atom_y;
-            double rz = gridz_cache[grid_id] - atom_z;
-            double rr = rx * rx + ry * ry + rz * rz + 1e-300;
-            double gto_sup = 1e-300;
-            for (int ip = 0; ip < nprim; ++ip) {
-                gto_sup += coeffs[ip] * exp(-exps[ip] * rr);
+        if (!is_large) {
+            int ng_in_tile = min(NG_PER_BLOCK, ngrids-grid0);
+            for (int grid_id = 0; grid_id < ng_in_tile; ++grid_id) {
+                double rx = gridx_cache[grid_id] - atom_x;
+                double ry = gridy_cache[grid_id] - atom_y;
+                double rz = gridz_cache[grid_id] - atom_z;
+                double rr = rx * rx + ry * ry + rz * rz + 1e-300;
+                double gto_sup = 1e-300;
+                for (int ip = 0; ip < nprim; ++ip) {
+                    gto_sup += coeffs[ip] * exp(-exps[ip] * rr);
+                }
+                is_large |= log(fabs(gto_sup)) + ang*log(rr)/2 > log_cutoff;
             }
-            is_large |= log(fabs(gto_sup)) + ang*log(rr)/2 > log_cutoff;
         }
+        // Finish reading this tile before any warp overwrites shared coordinates.
+        __syncthreads();
     }
     if (shl_block_id * blockDim.x + thread_id < nbas) {
         non0shl_mask[grid_block_id*nbas + ish] = is_large;
