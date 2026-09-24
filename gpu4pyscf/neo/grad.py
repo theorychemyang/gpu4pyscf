@@ -279,21 +279,52 @@ def _j_intercomponent_energy_per_atom(vhfopt, mols, dms, group1_size, verbose=No
 
 def _grad_eri_group(mf_grad, dms, keys1, keys2, atmlst):
     '''Evaluate all Coulomb-gradient edges between two component groups.'''
+    from gpu4pyscf.neo import int3c2e_bdiv
+
     mf = mf_grad.base
     mol1 = mf.components[keys1[0]].mol
     for t in keys1[1:]:
         mol1 = mol1 + mf.components[t].mol
     if keys2 is None:
-        vhfopt = rhf_grad._VHFOpt(mol1, mf.direct_scf_tol).build()
+        mol = mol1
         keys = keys1
         group1_size = None
     else:
         mol2 = mf.components[keys2[0]].mol
         for t in keys2[1:]:
             mol2 = mol2 + mf.components[t].mol
-        vhfopt = rhf_grad._VHFOpt(mol1 + mol2, mf.direct_scf_tol).build()
+        mol = mol1 + mol2
         keys = keys1 + keys2
         group1_size = len(keys1)
+    atom_component = numpy.hstack([
+        numpy.full(mf.components[t].mol.natm, i, dtype=numpy.int32)
+        for i, t in enumerate(keys)])
+
+    vhfopt = rhf_grad._VHFOpt(mol, mf.direct_scf_tol)
+    # Copied from scf.jk._VHFOpt.build.
+    log = logger.new_logger(vhfopt.mol)
+    cput0 = log.init_timer()
+    mol = vhfopt.sorted_mol = SortedGTO.from_mol(
+        vhfopt.mol, decontract=True, diffuse_cutoff=0.3)
+    l_ctr_counts = mol.l_ctr_counts
+
+    # very high angular momentum basis are processed on CPU
+    lmax = mol.uniq_l_ctr[:,0].max()
+    nbas_by_l = [l_ctr_counts[mol.uniq_l_ctr[:,0]==l].sum() for l in range(lmax+1)]
+    l_slices = numpy.append(0, numpy.cumsum(nbas_by_l))
+    if lmax > rhf_grad.LMAX:
+        vhfopt.h_shls = l_slices[rhf_grad.LMAX+1:].tolist()
+    else:
+        vhfopt.h_shls = []
+
+    # NEO: remove cross-component shell pairs before overlap and Schwarz
+    # screening constructs the exact-gradient work list.
+    shell_component = numpy.asarray(atom_component)[mol._bas[:,ATOM_OF]]
+    vhfopt.bas_pair_cache = int3c2e_bdiv._cache_q_cond_and_non0pairs(
+        mol, vhfopt.rys_envs, vhfopt.direct_scf_tol, shell_component,
+        tile=vhfopt.tile)
+    log.timer('Initialize q_cond', *cput0)
+    # End copied block.
     de = _j_intercomponent_energy_per_atom(
         vhfopt, [mf.components[t].mol for t in keys],
         [mf.components[t].charge*dms[t] for t in keys], group1_size)
