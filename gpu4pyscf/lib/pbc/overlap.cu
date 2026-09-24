@@ -28,10 +28,13 @@
 #define GOUT_WIDTH      36
 #define GOUT_WIDTH_IP1  18
 
+template <bool multi_out>
 __global__ static
 void int1e_ovlp_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
                        int *shl_pair_offsets, int *gout_stride_lookup,
-                       int naoi, int naoj, size_t ij_offset)
+                       int naoi, int naoj, size_t ij_offset,
+                       double **outs, int *component_id, int *local_ao_loc,
+                       int *component_nao)
 {
     int sp_block_id = blockIdx.x;
     int thread_id = threadIdx.x;
@@ -151,11 +154,23 @@ void int1e_ovlp_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
             int nfij = nfi * nfj;
             int *ao_loc = envs.ao_loc;
             int nbas = envs.cell0_nbas;
+            int component = multi_out ? component_id[ish] : 0;
+            if (multi_out) {
+                // Address each shell pair in its component-local output matrix.
+                ao_loc = local_ao_loc;
+                naoi = naoj = component_nao[component];
+            }
+            size_t nao2 = naoi * naoj;
             int cell_id = jsh / nbas;
             int jshp = jsh % nbas;
             int i0 = ao_loc[ish];
             int j0 = ao_loc[jshp];
-            double *out_subblock = out + (cell_id*naoi+i0) * naoj + j0 - ij_offset;
+            double *out_subblock;
+            if (multi_out) {
+                out_subblock = outs[component] + cell_id*nao2 + i0 * naoj + j0;
+            } else {
+                out_subblock = out + (cell_id*naoi+i0) * naoj + j0 - ij_offset;
+            }
 #pragma unroll
             for (int n = 0; n < GOUT_WIDTH; ++n) {
                 int ij = n*gout_stride+gout_id;
@@ -168,10 +183,13 @@ void int1e_ovlp_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
     }
 }
 
+template <bool multi_out>
 static __global__
 void int1e_kin_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
                       int *shl_pair_offsets, int *gout_stride_lookup,
-                      int naoi, int naoj, size_t ij_offset)
+                      int naoi, int naoj, size_t ij_offset,
+                      double **outs, int *component_id, int *local_ao_loc,
+                      int *component_nao)
 {
     int sp_block_id = blockIdx.x;
     int thread_id = threadIdx.x;
@@ -304,11 +322,23 @@ void int1e_kin_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
             int nfij = nfi * nfj;
             int *ao_loc = envs.ao_loc;
             int nbas = envs.cell0_nbas;
+            int component = multi_out ? component_id[ish] : 0;
+            if (multi_out) {
+                // Address each shell pair in its component-local output matrix.
+                ao_loc = local_ao_loc;
+                naoi = naoj = component_nao[component];
+            }
+            size_t nao2 = naoi * naoj;
             int cell_id = jsh / nbas;
             int jshp = jsh % nbas;
             int i0 = ao_loc[ish];
             int j0 = ao_loc[jshp];
-            double *out_subblock = out + (cell_id*naoi+i0) * naoj + j0 - ij_offset;
+            double *out_subblock;
+            if (multi_out) {
+                out_subblock = outs[component] + cell_id*nao2 + i0 * naoj + j0;
+            } else {
+                out_subblock = out + (cell_id*naoi+i0) * naoj + j0 - ij_offset;
+            }
 #pragma unroll
             for (int n = 0; n < GOUT_WIDTH; ++n) {
                 int ij = n*gout_stride+gout_id;
@@ -321,10 +351,13 @@ void int1e_kin_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
     }
 }
 
+template <bool multi_out>
 static __global__
 void int1e_ipovlp_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
                          int *shl_pair_offsets, int *gout_stride_lookup,
-                         int naoi, int naoj, size_t ij_offset)
+                         int naoi, int naoj, size_t ij_offset,
+                         double **outs, int *component_id, int *local_ao_loc,
+                         int *component_nao)
 {
     int sp_block_id = blockIdx.x;
     int thread_id = threadIdx.x;
@@ -459,12 +492,23 @@ void int1e_ipovlp_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
         if (pair_ij < shl_pair1) {
             int *ao_loc = envs.ao_loc;
             int nbas = envs.cell0_nbas;
+            int component = multi_out ? component_id[ish] : 0;
+            if (multi_out) {
+                // Address each shell pair in its component-local output matrix.
+                ao_loc = local_ao_loc;
+                naoi = naoj = component_nao[component];
+            }
             size_t nao2 = naoi * naoj;
             int cell_id = jsh / nbas;
             int jshp = jsh % nbas;
             int i0 = ao_loc[ish];
             int j0 = ao_loc[jshp];
-            double *outx = out + cell_id*nao2*3 + i0 * naoj + j0 - ij_offset;
+            double *outx;
+            if (multi_out) {
+                outx = outs[component] + cell_id*nao2*3 + i0 * naoj + j0;
+            } else {
+                outx = out + cell_id*nao2*3 + i0 * naoj + j0 - ij_offset;
+            }
             double *outy = outx + nao2;
             double *outz = outx + nao2 * 2;
             int nfi = c_nf[li];
@@ -484,10 +528,13 @@ void int1e_ipovlp_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
     }
 }
 
+template <bool multi_out>
 static __global__
 void int1e_ipkin_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
                         int *shl_pair_offsets, int *gout_stride_lookup,
-                        int naoi, int naoj, size_t ij_offset)
+                        int naoi, int naoj, size_t ij_offset,
+                        double **outs, int *component_id, int *local_ao_loc,
+                        int *component_nao)
 {
     int sp_block_id = blockIdx.x;
     int thread_id = threadIdx.x;
@@ -650,12 +697,23 @@ void int1e_ipkin_kernel(double *out, PBCIntEnvVars envs, int *bas_ij_idx,
         if (pair_ij < shl_pair1) {
             int *ao_loc = envs.ao_loc;
             int nbas = envs.cell0_nbas;
+            int component = multi_out ? component_id[ish] : 0;
+            if (multi_out) {
+                // Address each shell pair in its component-local output matrix.
+                ao_loc = local_ao_loc;
+                naoi = naoj = component_nao[component];
+            }
             size_t nao2 = naoi * naoj;
             int cell_id = jsh / nbas;
             int jshp = jsh % nbas;
             int i0 = ao_loc[ish];
             int j0 = ao_loc[jshp];
-            double *outx = out + cell_id*nao2*3 + i0 * naoj + j0 - ij_offset;
+            double *outx;
+            if (multi_out) {
+                outx = outs[component] + cell_id*nao2*3 + i0 * naoj + j0;
+            } else {
+                outx = out + cell_id*nao2*3 + i0 * naoj + j0 - ij_offset;
+            }
             double *outy = outx + nao2;
             double *outz = outx + nao2 * 2;
             int nfi = c_nf[li];
@@ -1092,15 +1150,23 @@ void kin_derivatives_kernel(double *grad, double *sigma, double *dm, PBCIntEnvVa
 
 // An estimation of the upper bound of the overlap |<cell0|supcmol>| for
 // shell pairs between the primitve cell and the super-mol
+template <bool indexed>
 __global__ static
 void ovlp_mask_estimation_kernel(int8_t *ovlp_mask, float *exps, float *log_coef,
                                  PBCIntEnvVars envs, int hermi, float log_cutoff,
-                                 double *bvkmesh_Ls, int ish0, int ish1, int jsh0, int jsh1)
+                                 double *bvkmesh_Ls, int ish0, int ish1, int jsh0, int jsh1,
+                                 const int *bas_ij_idx, size_t npairs)
 {
     size_t pair_ij = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     int nish = ish1 - ish0;
     int njsh = jsh1 - jsh0;
-    if (pair_ij >= (size_t)nish * njsh * envs.bvk_ncells) {
+    if (indexed) {
+        if (pair_ij >= npairs) {
+            return;
+        }
+        // NEO: decode a component-local candidate; output uses its task index.
+        pair_ij = bas_ij_idx[pair_ij];
+    } else if (pair_ij >= (size_t)nish * njsh * envs.bvk_ncells) {
         return;
     }
     int bvk_njsh = envs.bvk_ncells * njsh;
@@ -1112,7 +1178,6 @@ void ovlp_mask_estimation_kernel(int8_t *ovlp_mask, float *exps, float *log_coef
     if (hermi && ish_cell0 < jsh_cell0) {
         return;
     }
-
     int nimgs = envs.nimgs;
     int *bas = envs.bas;
     double *env = envs.env;
@@ -1154,11 +1219,16 @@ void ovlp_mask_estimation_kernel(int8_t *ovlp_mask, float *exps, float *log_coef
         float drj_fac = .5f*lj * logf(.5f*lj/aij + ai_aij * ai_aij * rr_ij + 1e-9f);
         float log_ovlp = log_fac - theta_ij*rr_ij + dri_fac + drj_fac;
         if (log_ovlp > log_cutoff) {
-            ovlp_mask[pair_ij] = 1;
-            if (hermi) {
-                int i = ish_cell0 - ish0;
-                int j = jsh_cell0 - jsh0;
-                ovlp_mask[(cell_id * nish + j) * (size_t)njsh + i] = 1;
+            if (indexed) {
+                // The caller supplies the required triangle or both orientations.
+                ovlp_mask[blockIdx.x * (size_t)blockDim.x + threadIdx.x] = 1;
+            } else {
+                ovlp_mask[pair_ij] = 1;
+                if (hermi) {
+                    int i = ish_cell0 - ish0;
+                    int j = jsh_cell0 - jsh0;
+                    ovlp_mask[(cell_id * nish + j) * (size_t)njsh + i] = 1;
+                }
             }
             break;
         }
@@ -1171,10 +1241,10 @@ int PBCint1e_ovlp(double *out, PBCIntEnvVars *envs, int shm_size,
                   int *shl_pair_offsets, int *gout_stride_lookup,
                   int naoi, int naoj, size_t ij_offset)
 {
-    cudaFuncSetAttribute(int1e_ovlp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    int1e_ovlp_kernel<<<nbatches_shl_pair, THREADS, shm_size>>>(
+    cudaFuncSetAttribute(int1e_ovlp_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_ovlp_kernel<false><<<nbatches_shl_pair, THREADS, shm_size>>>(
             out, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
-            naoi, naoj, ij_offset);
+            naoi, naoj, ij_offset, NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in int1e_ovlp kernel: %s\n", cudaGetErrorString(err));
@@ -1188,10 +1258,10 @@ int PBCint1e_kin(double *out, PBCIntEnvVars *envs, int shm_size,
                  int *shl_pair_offsets, int *gout_stride_lookup,
                  int naoi, int naoj, size_t ij_offset)
 {
-    cudaFuncSetAttribute(int1e_kin_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    int1e_kin_kernel<<<nbatches_shl_pair, THREADS, shm_size>>>(
+    cudaFuncSetAttribute(int1e_kin_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_kin_kernel<false><<<nbatches_shl_pair, THREADS, shm_size>>>(
             out, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
-            naoi, naoj, ij_offset);
+            naoi, naoj, ij_offset, NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in int1e_ovlp kernel: %s\n", cudaGetErrorString(err));
@@ -1200,15 +1270,50 @@ int PBCint1e_kin(double *out, PBCIntEnvVars *envs, int shm_size,
     return 0;
 }
 
+int PBCint1e_ovlp_multi_out(double **outs, PBCIntEnvVars *envs, int shm_size,
+                            int nbatches_shl_pair, int *bas_ij_idx,
+                            int *shl_pair_offsets, int *gout_stride_lookup,
+                            int *component_id, int *local_ao_loc,
+                            int *component_nao)
+{
+    cudaFuncSetAttribute(int1e_ovlp_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_ovlp_kernel<true><<<nbatches_shl_pair, THREADS, shm_size>>>(
+            NULL, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
+            0, 0, 0, outs, component_id, local_ao_loc, component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in int1e_ovlp_multi_out kernel: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int PBCint1e_kin_multi_out(double **outs, PBCIntEnvVars *envs, int shm_size,
+                           int nbatches_shl_pair, int *bas_ij_idx,
+                           int *shl_pair_offsets, int *gout_stride_lookup,
+                           int *component_id, int *local_ao_loc,
+                           int *component_nao)
+{
+    cudaFuncSetAttribute(int1e_kin_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_kin_kernel<true><<<nbatches_shl_pair, THREADS, shm_size>>>(
+            NULL, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
+            0, 0, 0, outs, component_id, local_ao_loc, component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in int1e_kin_multi_out kernel: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
 int PBCint1e_ipovlp(double *out, PBCIntEnvVars *envs, int shm_size,
                     int nbatches_shl_pair, int *bas_ij_idx,
                     int *shl_pair_offsets, int *gout_stride_lookup,
                     int naoi, int naoj, size_t ij_offset)
 {
-    cudaFuncSetAttribute(int1e_ipovlp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    int1e_ipovlp_kernel<<<nbatches_shl_pair, THREADS, shm_size>>>(
+    cudaFuncSetAttribute(int1e_ipovlp_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_ipovlp_kernel<false><<<nbatches_shl_pair, THREADS, shm_size>>>(
             out, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
-            naoi, naoj, ij_offset);
+            naoi, naoj, ij_offset, NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in int1e_ipovlp kernel: %s\n", cudaGetErrorString(err));
@@ -1222,13 +1327,49 @@ int PBCint1e_ipkin(double *out, PBCIntEnvVars *envs, int shm_size,
                    int *shl_pair_offsets, int *gout_stride_lookup,
                    int naoi, int naoj, size_t ij_offset)
 {
-    cudaFuncSetAttribute(int1e_ipkin_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    int1e_ipkin_kernel<<<nbatches_shl_pair, THREADS, shm_size>>>(
+    cudaFuncSetAttribute(int1e_ipkin_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_ipkin_kernel<false><<<nbatches_shl_pair, THREADS, shm_size>>>(
             out, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
-            naoi, naoj, ij_offset);
+            naoi, naoj, ij_offset, NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in int1e_ipkin kernel: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int PBCint1e_ipovlp_multi_out(double **outs, PBCIntEnvVars *envs, int shm_size,
+                              int nbatches_shl_pair, int *bas_ij_idx,
+                              int *shl_pair_offsets, int *gout_stride_lookup,
+                              int *component_id, int *local_ao_loc,
+                              int *component_nao)
+{
+    cudaFuncSetAttribute(int1e_ipovlp_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_ipovlp_kernel<true><<<nbatches_shl_pair, THREADS, shm_size>>>(
+            NULL, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
+            0, 0, 0, outs, component_id, local_ao_loc, component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in int1e_ipovlp_multi_out kernel: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int PBCint1e_ipkin_multi_out(double **outs, PBCIntEnvVars *envs, int shm_size,
+                             int nbatches_shl_pair, int *bas_ij_idx,
+                             int *shl_pair_offsets, int *gout_stride_lookup,
+                             int *component_id, int *local_ao_loc,
+                             int *component_nao)
+{
+    cudaFuncSetAttribute(int1e_ipkin_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    int1e_ipkin_kernel<true><<<nbatches_shl_pair, THREADS, shm_size>>>(
+            NULL, *envs, bas_ij_idx, shl_pair_offsets, gout_stride_lookup,
+            0, 0, 0, outs, component_id, local_ao_loc, component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in int1e_ipkin_multi_out kernel: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
@@ -1277,8 +1418,19 @@ void PBCovlp_mask_estimation(int8_t *ovlp_mask, float *exps, float *log_coeff,
     size_t njsh = jsh1 - jsh0;
     size_t npairs = nish * ncells * njsh;
     int nbatches = (npairs + 255) / 256;
-    ovlp_mask_estimation_kernel<<<nbatches, 256>>>(
+    ovlp_mask_estimation_kernel<false><<<nbatches, 256>>>(
             ovlp_mask, exps, log_coeff, *envs, hermi, log_cutoff, bvkmesh_Ls,
-            ish0, ish1, jsh0, jsh1);
+            ish0, ish1, jsh0, jsh1, NULL, 0);
+}
+
+void PBCovlp_mask_estimation_indexed(int8_t *ovlp_mask, float *exps, float *log_coeff,
+                                     PBCIntEnvVars *envs, float log_cutoff,
+                                     const int *bas_ij_idx, size_t npairs)
+{
+    int nbas = envs->cell0_nbas;
+    int nbatches = (npairs + 255) / 256;
+    ovlp_mask_estimation_kernel<true><<<nbatches, 256>>>(
+            ovlp_mask, exps, log_coeff, *envs, 0, log_cutoff, envs->img_coords,
+            0, nbas, 0, nbas, bas_ij_idx, npairs);
 }
 }

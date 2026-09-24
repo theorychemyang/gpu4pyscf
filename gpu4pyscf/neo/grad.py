@@ -6,6 +6,7 @@ import numpy
 import warnings
 from scipy.special import erf
 from pyscf import gto, lib, scf
+from pyscf.gto import ATOM_OF
 from pyscf.grad import rhf as rhf_grad_cpu
 from gpu4pyscf.dft import numint
 from gpu4pyscf.dft import rks
@@ -59,19 +60,8 @@ class ComponentGrad:
         if mol._pseudo:
             raise NotImplementedError("Pseudopotential gradient not supported for molecular system yet")
 
-        # Derivatives on the component orbitals.
-        from gpu4pyscf.pbc.gto.int1e import int1e_ipkin
-        sorted_mol = SortedMole.from_mol(mol, decontract=True)
-        h1 = -int1e_ipkin(sorted_mol) / self.base.mass
-        h1 -= rhf_grad.int1e_ipnuc(mol) * self.base.charge
-        dh = rhf_grad.contract_h1e_dm(mol, h1, dm0, hermi=1)
-        s1 = cupy.asarray(self.get_ovlp(mol))
-        dh -= rhf_grad.contract_h1e_dm(mol, s1, dme0, hermi=1)
+        dh = _grouped_hcore_energy({'n': self}, {'n': dm0}, {'n': dme0})
 
-        # Derivatives on the classical potential centers.
-        charges = cupy.asarray(mol.atom_charges() * self.base.charge)
-        if cupy.any(charges != 0):
-            dh += int1e_grids_ip2(mol, mol.atom_coords(), charges=charges, dm=dm0).T.get()
         return dh
 
     def energy_ee(self, mol=None, dm=None, verbose=None):
@@ -358,14 +348,104 @@ def grad_int(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     return de
 
 
+def _grouped_hcore_energy(components, dm0, dme0):
+    from gpu4pyscf.df.int3c2e_bdiv import int3c2e_scheme
+    from gpu4pyscf.neo import int1e, int3c2e_bdiv
+
+    mols = {t: comp.mol for t, comp in components.items()}
+    mol = next(iter(mols.values()))
+    # Follow rhf._grad_nuc_without_ecp with one optimizer whose AO-pair list
+    # contains the component-local pairs from all nuclear components.
+    auxmol = gto.fakemol_for_charges(mol.atom_coords())
+    int3c2e_opt = int3c2e_bdiv.Int3c2eOpt(mols, auxmol).build()
+    component_mols, local_ao_loc = int3c2e_opt._component_mol_data()
+
+    dms = {t: component_mols[t].apply_C_mat_CT(dm0[t]) for t in components}
+    # Each target nucleus sees the classical nuclear potential scaled by its
+    # own charge.
+    auxvec = {t: cupy.asarray(-mols[t].atom_charges() * components[t].base.charge,
+                              dtype=numpy.float64) for t in components}
+
+    combined_mol = int3c2e_opt.mol
+    auxmol = int3c2e_opt.auxmol
+    nsp_per_block, gout_stride, shm_size = int3c2e_scheme(
+        short_range=False, gout_width=54, deriv=(1,0,0))
+    lmax = combined_mol.uniq_l_ctr[:,0].max()
+    laux = auxmol.uniq_l_ctr[:,0].max()
+    shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
+    bas_ij_idx, shl_pair_offsets = int3c2e_bdiv._aggregate_shl_pair_blocks(
+        combined_mol, int3c2e_opt.bas_ij_blocks, nsp_per_block[0]*16)
+    ksh_offsets = numpy.append(0, numpy.cumsum(auxmol.l_ctr_counts))
+    ksh_offsets_gpu = cupy.asarray(ksh_offsets + combined_mol.nbas, dtype=numpy.int32)
+
+    # rhf._grad_nuc_without_ecp passes one dense DM and one charge vector.  The
+    # grouped kernel selects the corresponding component-local pair here.
+    component_index = {t: i for i, t in enumerate(components)}
+    pair_component = cupy.asarray(numpy.hstack([
+        numpy.full(len(bas_ij), component_index[t], dtype=numpy.int32)
+        for (_, bas_ij), t in zip(
+            int3c2e_opt.bas_ij_blocks, int3c2e_opt.block_components)]))
+    dm_ptrs = cupy.asarray(numpy.asarray(
+        [dms[t].data.ptr for t in components], dtype=numpy.uintp))
+    auxvec_ptrs = cupy.asarray(numpy.asarray(
+        [auxvec[t].data.ptr for t in components], dtype=numpy.uintp))
+    local_ao_loc = cupy.asarray(local_ao_loc, dtype=numpy.int32)
+    component_nao = cupy.asarray([component_mols[t].nao for t in components], dtype=numpy.int32)
+
+    de = cupy.zeros((combined_mol.natm, 3))
+    de_aux = cupy.zeros_like(de)
+    err = rhf_grad.libvhf_rys.sum_j_int3c2e_ip1_multi_in(
+        ctypes.cast(de.data.ptr, ctypes.c_void_p),
+        ctypes.cast(de_aux.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dm_ptrs.data.ptr, ctypes.c_void_p),
+        ctypes.cast(auxvec_ptrs.data.ptr, ctypes.c_void_p),
+        ctypes.byref(int3c2e_opt.int3c2e_envs),
+        ctypes.c_int(shm_size_max),
+        ctypes.c_int(len(shl_pair_offsets) - 1),
+        ctypes.c_int(len(ksh_offsets) - 1),
+        ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+        ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+        ctypes.cast(ksh_offsets_gpu.data.ptr, ctypes.c_void_p),
+        ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+        ctypes.cast(pair_component.data.ptr, ctypes.c_void_p),
+        ctypes.cast(local_ao_loc.data.ptr, ctypes.c_void_p),
+        ctypes.cast(component_nao.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(combined_mol.natm))
+    if err != 0:
+        raise RuntimeError('int3c2e_ejk_ip1 failed')
+
+    natm = mol.natm
+    attraction = de_aux[:natm]
+    # AO derivatives are indexed by the repeated atoms in the concatenated
+    # molecule; auxiliary-center derivatives use the single physical atom set.
+    p0 = 0
+    for t in components:
+        p1 = p0 + mols[t].natm
+        attraction += de[p0:p1]
+        p0 = p1
+    attraction *= 2
+
+    int1e_opt = int1e.Int1eOpt(mols, hermi=0)
+    ipkin = int1e_opt.get_ipkin()
+    ipovlp = int1e_opt.get_ipovlp()
+    de = attraction.get()
+    for t, comp in components.items():
+        # The remaining kinetic, overlap, and extra-force contractions retain
+        # the component gradient formula; only their integral builds are shared.
+        dh = -rhf_grad.contract_h1e_dm(comp.mol, ipkin[t] / comp.base.mass, dm0[t], hermi=1)
+        dh += rhf_grad.contract_h1e_dm(comp.mol, ipovlp[t], dme0[t], hermi=1)
+        de += dh
+    return de
+
+
 def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     mf = mf_grad.base
     mol = mf_grad.mol
     if atmlst is None:
         atmlst = range(mol.natm)
-    de = numpy.zeros((len(atmlst), 3))
     if not hasattr(mf, 'epc') or mf.epc is None:
-        return de
+        return numpy.zeros((len(atmlst), 3))
+    de = cupy.zeros((len(atmlst), 3))
 
     if mo_energy is None: mo_energy = mf.mo_energy
     if mo_occ is None: mo_occ = mf.mo_occ
@@ -388,7 +468,7 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         if len(mf._epc_n_types) > 0:
             mf._skip_epc = False
     if getattr(mf, '_skip_epc', False):
-        return de
+        return de.get()
 
     if mf._epc_n_types is None:
         n_types = []
@@ -404,7 +484,7 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         n_types = mf._epc_n_types
     if len(n_types) == 0:
         mf._skip_epc = True
-        return de
+        return de.get()
 
     mol_n_all = mf.components[n_types[0]].mol
     n_slices = {}
@@ -427,7 +507,7 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         block_ids = [i for i, x in enumerate(non0ao_idx_n) if len(x[1]) > 0]
         if len(block_ids) == 0:
             mf._skip_epc = True
-            return de
+            return de.get()
         starts = (cupy.asarray(block_ids)[:,None] * numint.MIN_BLK_SIZE
                   + cupy.arange(numint.MIN_BLK_SIZE))
         valid_idx = starts[starts < grids_e.coords.shape[0]]
@@ -501,10 +581,12 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         for n_type in n_types:
             n0, n1 = n_slices[n_type]
             mask_n = (orig_idx_n >= n0) & (orig_idx_n < n1)
-            if not cupy.any(mask_n):
+            # Share component AO selection between density and AO derivatives.
+            idx = cupy.where(mask_n)[0]
+            if idx.size == 0:
                 continue
-            idx_n_t = idx_n[mask_n]
-            ao_n_t = ao_n[:,mask_n]
+            idx_n_t = idx_n[idx]
+            ao_n_t = ao_n[:,idx]
             dm_n_mask = dm_n_all[idx_n_t[:,None],idx_n_t]
             rho_n = numint.eval_rho(sorted_mol_n, ao_n_t[0], dm_n_mask, hermi=1)
             rho_n = cupy.maximum(rho_n, 0)
@@ -525,7 +607,7 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     aoslices = mol_e.aoslice_by_atom()
     for i0, ia in enumerate(atmlst):
         p0, p1 = aoslices[ia,2:]
-        de[i0] -= cupy.einsum('xij,ij->x', vxc_e[:,p0:p1], dm_e[p0:p1]).real.get() * 2
+        de[i0] -= cupy.einsum('xij,ij->x', vxc_e[:,p0:p1], dm_e[p0:p1]).real * 2
 
     for n_type in n_types:
         n0, n1 = n_slices[n_type]
@@ -535,8 +617,8 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         for i0, ia in enumerate(atmlst):
             p0, p1 = aoslices[ia,2:]
             if p1 > p0:
-                de[i0] -= cupy.einsum('xij,ij->x', vxc_n_t[:,p0:p1], dm_n[p0:p1]).real.get() * 2
-    return de
+                de[i0] -= cupy.einsum('xij,ij->x', vxc_n_t[:,p0:p1], dm_n[p0:p1]).real * 2
+    return de.get()
 
 
 class Gradients(rhf_grad.GradientsBase):
@@ -614,16 +696,26 @@ class Gradients(rhf_grad.GradientsBase):
         if self.grid_response and hasattr(self.base, 'epc') and self.base.epc is not None:
             raise NotImplementedError('Grid response for NEO EPC gradients')
 
-        # Component gradient implementations return all atoms; apply atmlst
-        # only after assembling the full multicomponent gradient.
         de = 0
-        # TODO: Batch nuclear one-electron gradient integrals without forming
-        # cross-component AO blocks.  Each grad_elec call currently launches
-        # the small hcore, overlap, and optional MM derivative kernels separately.
+        grouped_components = {}
         for t, comp in self.components.items():
             if self.grid_response is not None and hasattr(comp, 'grid_response'):
                 comp.grid_response = self.grid_response
-            de += comp.grad_elec(mo_energy=mo_energy[t], mo_coeff=mo_coeff[t], mo_occ=mo_occ[t])
+            if t.startswith('n'):
+                grouped_components[t] = comp
+            else:
+                de += comp.grad_elec(mo_energy=mo_energy[t],
+                                     mo_coeff=mo_coeff[t],
+                                     mo_occ=mo_occ[t])
+        if grouped_components:
+            dm0 = {}
+            dme0 = {}
+            for t, comp in grouped_components.items():
+                dm0[t] = comp.base.make_rdm1(mo_coeff[t], mo_occ[t])
+                dme0[t] = comp.make_rdm1e(mo_energy[t], mo_coeff[t], mo_occ[t])
+            de += _grouped_hcore_energy(grouped_components, dm0, dme0)
+            for comp in grouped_components.values():
+                de += cupy.asnumpy(comp.extra_force())
 
         de += self.grad_int(mo_energy, mo_coeff, mo_occ)
         if hasattr(self.base, 'epc') and self.base.epc is not None:
@@ -669,7 +761,7 @@ class Gradients(rhf_grad.GradientsBase):
         coords = mm_mol.atom_coords()
         charges = mm_mol.atom_charges()
         expnts = mm_mol.get_zetas()
-        g = numpy.zeros_like(coords)
+        g = cupy.zeros(coords.shape)
         # TODO: Contract the MM potential derivatives for all component-local
         # DMs in one launch without forming a padded block-diagonal DM.
         for t, comp in self.base.components.items():
@@ -677,9 +769,8 @@ class Gradients(rhf_grad.GradientsBase):
             if dm_comp.ndim > 2:
                 dm_comp = dm_comp[0] + dm_comp[1]
             g += int1e_grids_ip2(comp.mol, coords, dm=dm_comp,
-                                 charge_exponents=expnts).T.get() \
-                    * charges[:,None] * comp.charge
-        return g
+                                 charge_exponents=expnts).T * comp.charge
+        return (g * cupy.asarray(charges[:,None])).get()
 
     contract_hcore_mm = grad_hcore_mm
 
