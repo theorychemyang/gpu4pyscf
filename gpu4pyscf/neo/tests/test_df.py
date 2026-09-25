@@ -322,14 +322,15 @@ class KnownValues(unittest.TestCase):
         dm = mf_gpu.get_init_guess()
         mf_gpu.get_veff(dm=dm)
 
-        cderi = mf_gpu.components['e'].with_df._cderi[0]
+        cderi = numpy.concatenate([cupy.asnumpy(c)
+                                   for c in mf_gpu.components['e'].with_df._cderi])
         ref_df = gpu_scf.HF(mol.components['e']).density_fit(
             auxbasis=mf_gpu.with_df.auxbasis).with_df
         ref_df.build()
-        ref = ref_df._cderi[0]
+        ref = numpy.concatenate([cupy.asnumpy(c) for c in ref_df._cderi])
 
         self.assertEqual(cderi.shape, ref.shape)
-        self.assertLess(cupy.linalg.norm(cderi - ref), 1e-10)
+        self.assertLess(numpy.linalg.norm(cderi - ref), 1e-10)
 
     def test_schur_cpu_memory_e_cderi_is_view(self):
         mf_gpu = gpu_neo.KS(mol, xc='B3LYP', epc=None).density_fit(
@@ -338,12 +339,14 @@ class KnownValues(unittest.TestCase):
         dm = mf_gpu.get_init_guess()
         mf_gpu.get_veff(dm=dm)
 
-        cderi = mf_gpu.with_df._cderi['e'][0]
-        cderi_e = mf_gpu.components['e'].with_df._cderi[0]
-
-        self.assertIsInstance(cderi, numpy.ndarray)
-        self.assertTrue(numpy.shares_memory(cderi, cderi_e))
-        self.assertEqual(cderi_e.shape[0], mf_gpu.components['e'].with_df.naux)
+        naux = 0
+        for cderi, cderi_e in zip(mf_gpu.with_df._cderi['e'],
+                                  mf_gpu.components['e'].with_df._cderi):
+            self.assertIsInstance(cderi, numpy.ndarray)
+            if cderi_e.size:
+                self.assertTrue(numpy.shares_memory(cderi, cderi_e))
+            naux += cderi_e.shape[0]
+        self.assertEqual(naux, mf_gpu.components['e'].with_df.naux)
 
     def test_schur_rsh_k_matches_eonly_df(self):
         mf_gpu = gpu_neo.KS(mol, xc='CAMB3LYP', epc=None).density_fit(

@@ -121,7 +121,13 @@ class DF(df.DF):
                 self._elec_with_df.naux = naux_e
                 self._elec_with_df.intopt = self.intopt['e']
                 self._elec_with_df._cderi_idx = self._cderi_idx['e']
-                self._elec_with_df._cderi = [cderi[:naux_e] for cderi in self._cderi['e']]
+                # Electronic-only CDERI occupies the first naux_e global rows.
+                # Keep each device's share of those rows as a view.
+                self._elec_with_df._cderi = []
+                aux0 = 0
+                for cderi in self._cderi['e']:
+                    self._elec_with_df._cderi.append(cderi[:max(0, naux_e-aux0)])
+                    aux0 += cderi.shape[0]
             log.timer_debug1('cholesky_eri', *t0)
         return self
 
