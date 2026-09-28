@@ -1268,6 +1268,24 @@ class _DFNEO:
 
         self.components['e']._vint = None
 
+        # As in hf._grouped_energy, batch equal-sized nuclear AO matrices
+        # to contract and download their individual Coulomb energies together.
+        groups = {}
+        for t in self.components:
+            if t != 'e' and dm[t].ndim == 2:
+                key = (dm[t].shape, dm[t].dtype, vj[t].dtype)
+                groups.setdefault(key, []).append(t)
+        ecoul_n = {}
+        for keys in groups.values():
+            if len(keys) == 1:
+                t = keys[0]
+                ecoul_n[t] = float(cupy.einsum('ij,ji->', cupy.asarray(dm[t]), vj[t]).real.get()) * .5
+            else:
+                dm_batch = cupy.stack([cupy.asarray(dm[t]) for t in keys])
+                vj_batch = cupy.stack([vj[t] for t in keys])
+                energies = cupy.einsum('nij,nji->n', dm_batch, vj_batch).real.get() * .5
+                ecoul_n.update(zip(keys, map(float, energies)))
+
         for t, comp in self.components.items():
             if t == 'e':
                 continue
@@ -1276,11 +1294,7 @@ class _DFNEO:
             assert not isinstance(comp, (scf.rohf.ROHF, scf.uhf.UHF, scf.ghf.GHF))
             vint_t = vj[t] + epc[t]
             comp._vint = cupy.asarray(vint_t)
-            dm_t = dm[t]
-            ecoul = None
-            dm_t = cupy.asarray(dm_t)
-            if dm_t.ndim == 2:
-                ecoul = float(cupy.einsum('ij,ji->', dm_t, vj[t]).real.get()) * .5
+            ecoul = ecoul_n.get(t)
             vhf[t] = tag_array(vint_t, ecoul=ecoul, vint=vint_t)
             if hasattr(epc[t], 'exc'):
                 vhf[t] = tag_array(vhf[t], exc=epc[t].exc)
